@@ -9,11 +9,18 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 from werkzeug.utils import secure_filename
 import tempfile
 
+# New imports for new file formats
+from docx import Document
+from fpdf import FPDF
+import matplotlib
+matplotlib.use('Agg') # Required for server-side image generation
+import matplotlib.pyplot as plt
+
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = 'helloworld' # Replace with your OCR.space API key
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json'}
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json', 'txt'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -25,8 +32,8 @@ def process_file(filepath, filename):
     try:
         if ext in ['xlsx', 'xls']:
             df = pd.read_excel(filepath, header=None)
-        elif ext == 'csv':
-            df = pd.read_csv(filepath, header=None, on_bad_lines='skip')
+        elif ext == 'csv' or ext == 'txt':
+            df = pd.read_csv(filepath, header=None, on_bad_lines='skip', sep=None, engine='python')
         elif ext == 'json':
             df = pd.read_json(filepath)
         elif ext in ['png', 'jpg', 'jpeg', 'pdf']:
@@ -58,10 +65,11 @@ def process_file(filepath, filename):
             df.reset_index(drop=True, inplace=True)
             df.columns = [str(col).strip().upper() for col in df.columns]
             df = df.fillna("") 
+            # Scrub illegal invisible XML characters (prevents Excel crashes)
+            df = df.replace({r'[\x00-\x08\x0b-\x0c\x0e-\x1f]': ''}, regex=True)
             return df, None
             
-        return None, "Could not extract data."
-
+        return None, "Could not extract structured data."
     except Exception as e:
         return None, str(e)
 
@@ -92,35 +100,90 @@ def upload_file():
         if error:
             return jsonify({'error': error})
             
-        table_html = df.to_html(classes='min-w-full text-left text-sm font-light', index=False, border=0)
+        table_html = df.to_html(classes='min-w-full text-left text-sm font-light border-collapse', index=False, border=0)
         return jsonify({'message': 'Success', 'table': table_html, 'json_data': df.to_dict('records')})
 
     return jsonify({'error': 'Invalid file type'})
 
 @app.route('/export', methods=['POST'])
 def export_data():
-    """ Handle New Excel / CSV Export """
+    """ Handles exporting to ALL formats (Excel, CSV, JSON, TXT, DOCX, PDF, Image) """
     data = request.json.get('data')
     format_type = request.json.get('format')
-    
     df = pd.DataFrame(data)
     output = io.BytesIO()
     
+    mimetype = ''
+    filename = ''
+
     if format_type == 'excel':
         df.to_excel(output, index=False, engine='openpyxl')
         mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         filename = 'Cleaned_Data.xlsx'
-    else:
+    
+    elif format_type == 'csv':
         df.to_csv(output, index=False)
         mimetype = 'text/csv'
         filename = 'Cleaned_Data.csv'
         
+    elif format_type == 'json':
+        df.to_json(output, orient='records', indent=4)
+        mimetype = 'application/json'
+        filename = 'Cleaned_Data.json'
+        
+    elif format_type == 'txt':
+        df.to_csv(output, index=False, sep='\t')
+        mimetype = 'text/plain'
+        filename = 'Cleaned_Data.txt'
+        
+    elif format_type == 'docx':
+        doc = Document()
+        doc.add_heading('Data Export', 0)
+        table = doc.add_table(rows=1, cols=len(df.columns))
+        table.style = 'Table Grid'
+        for i, col in enumerate(df.columns): 
+            table.rows[0].cells[i].text = str(col)
+        for _, row in df.iterrows():
+            row_cells = table.add_row().cells
+            for i, item in enumerate(row): 
+                row_cells[i].text = str(item)
+        doc.save(output)
+        mimetype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        filename = 'Cleaned_Data.docx'
+        
+    elif format_type == 'pdf':
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=9)
+        col_width = 190 / (len(df.columns) or 1)
+        for col in df.columns:
+            pdf.cell(col_width, 10, str(col)[:15], border=1)
+        pdf.ln()
+        for _, row in df.iterrows():
+            for item in row:
+                pdf.cell(col_width, 10, str(item)[:15], border=1)
+            pdf.ln()
+        pdf_bytes = pdf.output(dest='S').encode('latin1')
+        output.write(pdf_bytes)
+        mimetype = 'application/pdf'
+        filename = 'Cleaned_Data.pdf'
+        
+    elif format_type == 'image':
+        fig, ax = plt.subplots(figsize=(max(8, len(df.columns)*1.5), max(4, len(df)*0.5)))
+        ax.axis('tight')
+        ax.axis('off')
+        ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
+        plt.savefig(output, format='png', bbox_inches='tight', dpi=300)
+        plt.close(fig)
+        mimetype = 'image/png'
+        filename = 'Cleaned_Data.png'
+
     output.seek(0)
     return send_file(output, mimetype=mimetype, as_attachment=True, download_name=filename)
 
 @app.route('/append_export', methods=['POST'])
 def append_export():
-    """ Appends data to an existing uploaded Excel file """
+    """ Appends data to an existing uploaded Excel or CSV file """
     if 'existing_file' not in request.files:
         return jsonify({'error': 'No existing file provided'})
         
@@ -130,26 +193,30 @@ def append_export():
     if not new_data_json or existing_file.filename == '':
         return jsonify({'error': 'Missing data or file'})
         
+    ext = existing_file.filename.rsplit('.', 1)[1].lower()
+    df_new = pd.DataFrame(json.loads(new_data_json))
+    output = io.BytesIO()
+    
     try:
-        data_list = json.loads(new_data_json)
-        df_new = pd.DataFrame(data_list)
-        
-        # Load the user's existing excel file
-        wb = load_workbook(existing_file)
-        ws = wb.active
-        
-        # Append rows without headers
-        for r in dataframe_to_rows(df_new, index=False, header=False): 
-            ws.append(r)
+        if ext in ['xlsx', 'xls']:
+            wb = load_workbook(existing_file)
+            ws = wb.active
+            for r in dataframe_to_rows(df_new, index=False, header=False): 
+                ws.append(r)
+            wb.save(output)
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             
-        # Save to memory and send back to user
-        output = io.BytesIO()
-        wb.save(output)
+        elif ext == 'csv':
+            existing_df = pd.read_csv(existing_file)
+            combined_df = pd.concat([existing_df, df_new], ignore_index=True)
+            combined_df.to_csv(output, index=False)
+            mimetype = 'text/csv'
+        else:
+            return jsonify({'error': 'Can only append to Excel or CSV files.'})
+            
         output.seek(0)
-        
-        # Prepend 'Updated_' to the original filename
         download_name = 'Updated_' + secure_filename(existing_file.filename)
-        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=download_name)
+        return send_file(output, mimetype=mimetype, as_attachment=True, download_name=download_name)
     except Exception as e:
         return jsonify({'error': f'Failed to append: {str(e)}'})
 
