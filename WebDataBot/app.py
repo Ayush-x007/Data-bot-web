@@ -19,7 +19,6 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 API_KEY = 'helloworld' 
-# ADDED .docx TO ALLOWED EXTENSIONS
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json', 'txt', 'docx'}
 
 def allowed_file(filename):
@@ -37,7 +36,6 @@ def process_file(filepath, filename):
         elif ext == 'json':
             df = pd.read_json(filepath)
             
-        # --- NEW: WORD DOCUMENT UPLOAD SUPPORT ---
         elif ext == 'docx':
             doc = Document(filepath)
             data = []
@@ -119,92 +117,100 @@ def upload_file():
 
 @app.route('/export', methods=['POST'])
 def export_data():
-    data = request.json.get('data')
-    format_type = request.json.get('format')
-    df = pd.DataFrame(data)
-    output = io.BytesIO()
-    
-    mimetype = ''
-    filename = ''
+    # ADDED: A massive try/except block to catch crashes and report them properly
+    try:
+        data = request.json.get('data')
+        format_type = request.json.get('format')
+        df = pd.DataFrame(data)
+        output = io.BytesIO()
+        
+        mimetype = ''
+        filename = ''
 
-    if format_type == 'excel':
-        df.to_excel(output, index=False, engine='openpyxl')
-        mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        filename = 'Cleaned_Data.xlsx'
-    
-    elif format_type == 'csv':
-        df.to_csv(output, index=False)
-        mimetype = 'text/csv'
-        filename = 'Cleaned_Data.csv'
+        if format_type == 'excel':
+            df.to_excel(output, index=False, engine='openpyxl')
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            filename = 'Cleaned_Data.xlsx'
         
-    elif format_type == 'json':
-        df.to_json(output, orient='records', indent=4)
-        mimetype = 'application/json'
-        filename = 'Cleaned_Data.json'
-        
-    elif format_type == 'txt':
-        df.to_csv(output, index=False, sep='\t')
-        mimetype = 'text/plain'
-        filename = 'Cleaned_Data.txt'
-        
-    elif format_type == 'docx':
-        doc = Document()
-        doc.add_heading('Data Export', 0)
-        table = doc.add_table(rows=1, cols=len(df.columns))
-        table.style = 'Table Grid'
-        for i, col in enumerate(df.columns): 
-            table.rows[0].cells[i].text = str(col)
-        for _, row in df.iterrows():
-            row_cells = table.add_row().cells
-            for i, item in enumerate(row): 
-                row_cells[i].text = str(item)
-        doc.save(output)
-        mimetype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        filename = 'Cleaned_Data.docx'
-        
-    elif format_type == 'pdf':
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Arial", size=9)
-        col_width = 190 / (len(df.columns) or 1)
-        
-        # FIX: Sanitize text to prevent PDF from crashing the server on weird symbols
-        def sanitize(text):
-            return str(text)[:20].encode('latin-1', 'replace').decode('latin-1')
+        elif format_type == 'csv':
+            df.to_csv(output, index=False)
+            mimetype = 'text/csv'
+            filename = 'Cleaned_Data.csv'
             
-        for col in df.columns:
-            pdf.cell(col_width, 10, sanitize(col), border=1)
-        pdf.ln()
-        for _, row in df.iterrows():
-            for item in row:
-                pdf.cell(col_width, 10, sanitize(item), border=1)
+        elif format_type == 'json':
+            df.to_json(output, orient='records', indent=4)
+            mimetype = 'application/json'
+            filename = 'Cleaned_Data.json'
+            
+        elif format_type == 'txt':
+            df.to_csv(output, index=False, sep='\t')
+            mimetype = 'text/plain'
+            filename = 'Cleaned_Data.txt'
+            
+        elif format_type == 'docx':
+            doc = Document()
+            doc.add_heading('Data Export', 0)
+            table = doc.add_table(rows=1, cols=len(df.columns))
+            table.style = 'Table Grid'
+            for i, col in enumerate(df.columns): 
+                table.rows[0].cells[i].text = str(col)
+            for _, row in df.iterrows():
+                row_cells = table.add_row().cells
+                for i, item in enumerate(row): 
+                    row_cells[i].text = str(item)
+            doc.save(output)
+            mimetype = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            filename = 'Cleaned_Data.docx'
+            
+        elif format_type == 'pdf':
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=9)
+            col_width = 190 / (len(df.columns) or 1)
+            
+            # FIX: Aggressive text sanitizer for PDF to prevent crashes
+            def sanitize(text):
+                # Only allows safe ASCII characters, replaces weird symbols with a '?'
+                return "".join([c if ord(c) < 128 else '?' for c in str(text)[:30]])
+                
+            for col in df.columns:
+                pdf.cell(col_width, 10, sanitize(col), border=1)
             pdf.ln()
-        pdf_bytes = pdf.output(dest='S').encode('latin1')
-        output.write(pdf_bytes)
-        mimetype = 'application/pdf'
-        filename = 'Cleaned_Data.pdf'
-        
-    elif format_type == 'image':
-        # FIX: Dynamic High-Res Image Sizing
-        cols = len(df.columns)
-        rows = len(df) + 1
-        fig, ax = plt.subplots(figsize=(max(10, cols * 2), max(5, rows * 0.6)))
-        ax.axis('tight')
-        ax.axis('off')
-        
-        table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(12)
-        table.scale(1, 2) # Adds padding to rows so text isn't blurry or cramped
-        
-        plt.savefig(output, format='png', bbox_inches='tight', dpi=400) # Upgraded to 400 DPI
-        plt.close('all') # CRITICAL: Frees server memory so it doesn't crash on the next download
-        
-        mimetype = 'image/png'
-        filename = 'Cleaned_Data.png'
+            for _, row in df.iterrows():
+                for item in row:
+                    pdf.cell(col_width, 10, sanitize(item), border=1)
+                pdf.ln()
+            pdf_bytes = pdf.output(dest='S').encode('latin1', 'ignore')
+            output.write(pdf_bytes)
+            mimetype = 'application/pdf'
+            filename = 'Cleaned_Data.pdf'
+            
+        elif format_type == 'image':
+            cols = len(df.columns)
+            rows = len(df) + 1
+            fig, ax = plt.subplots(figsize=(max(10, cols * 2), max(5, rows * 0.6)))
+            ax.axis('tight')
+            ax.axis('off')
+            
+            table = ax.table(cellText=df.values, colLabels=df.columns, loc='center', cellLoc='center')
+            table.auto_set_font_size(False)
+            table.set_fontsize(12)
+            table.scale(1, 2) 
+            
+            # FIX: Lowered DPI to 200 to prevent out-of-memory server crashes on Render Free Tier
+            plt.savefig(output, format='png', bbox_inches='tight', dpi=200) 
+            plt.close('all') 
+            
+            mimetype = 'image/png'
+            filename = 'Cleaned_Data.png'
 
-    output.seek(0)
-    return send_file(output, mimetype=mimetype, as_attachment=True, download_name=filename)
+        output.seek(0)
+        return send_file(output, mimetype=mimetype, as_attachment=True, download_name=filename)
+        
+    except Exception as e:
+        # If it fails, print the error to your Render logs and tell the user gracefully
+        print(f"EXPORT ERROR: {str(e)}")
+        return jsonify({'error': f'Failed to generate file: {str(e)}'}), 500
 
 @app.route('/append_export', methods=['POST'])
 def append_export():
