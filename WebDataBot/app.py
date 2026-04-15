@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
 from werkzeug.utils import secure_filename
 import tempfile
+import PyPDF2
 
 from docx import Document
 from fpdf import FPDF
@@ -18,8 +19,16 @@ import matplotlib.pyplot as plt
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-API_KEY = 'helloworld' 
+API_KEY = 'helloworld' # Replace with your real OCR.space key for better speed
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'csv', 'xlsx', 'xls', 'json', 'txt', 'docx'}
+
+# Limit maximum upload size to 10 MB
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024 
+
+# Safely catch files larger than 10MB without crashing the server
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({'error': 'File is too large! Maximum allowed size is 10 MB.'}), 413
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -47,7 +56,53 @@ def process_file(filepath, filename):
             else:
                 return None, "No tables found in the Word document."
                 
-        elif ext in ['png', 'jpg', 'jpeg', 'pdf']:
+        # --- NEW: PDF SLICER ENGINE ---
+        elif ext == 'pdf':
+            reader = PyPDF2.PdfReader(filepath)
+            total_pages = len(reader.pages)
+            all_lines = []
+            
+            # Slice the PDF into chunks of 3 pages maximum
+            for i in range(0, total_pages, 3):
+                writer = PyPDF2.PdfWriter()
+                chunk_pages = min(3, total_pages - i)
+                
+                for j in range(chunk_pages):
+                    writer.add_page(reader.pages[i+j])
+                
+                # Create a temporary file for the chunk
+                chunk_fd, chunk_path = tempfile.mkstemp(suffix='.pdf')
+                os.close(chunk_fd) 
+                
+                with open(chunk_path, 'wb') as f_out:
+                    writer.write(f_out)
+                    
+                # Send the 3-page chunk to OCR
+                url = "https://api.ocr.space/parse/image"
+                payload = {'apikey': API_KEY, 'isTable': True, 'scale': True}
+                with open(chunk_path, 'rb') as f_in:
+                    response = requests.post(url, files={'file': f_in}, data=payload)
+                    
+                # Delete the temporary chunk to save server memory
+                os.remove(chunk_path)
+                
+                result = response.json()
+                if result.get('IsErroredOnProcessing'):
+                    return None, f"OCR Error on pages {i+1} to {i+chunk_pages}: {result.get('ErrorMessage')[0]}"
+                
+                # Extract text from this chunk
+                for parsed_result in result.get('ParsedResults', []):
+                    text = parsed_result.get('ParsedText', '')
+                    lines = [line.split('\t') for line in text.split('\r\n') if line.strip()]
+                    all_lines.extend(lines)
+            
+            if all_lines:
+                df = pd.DataFrame(all_lines)
+            else:
+                return None, "Cloud OCR could not find any readable text in the PDF."
+
+        # Regular Images (no slicing needed)
+        elif ext in ['png', 'jpg', 'jpeg']:
             url = "https://api.ocr.space/parse/image"
             payload = {'apikey': API_KEY, 'isTable': True, 'scale': True}
             with open(filepath, 'rb') as f:
@@ -117,7 +172,6 @@ def upload_file():
 
 @app.route('/export', methods=['POST'])
 def export_data():
-    # ADDED: A massive try/except block to catch crashes and report them properly
     try:
         data = request.json.get('data')
         format_type = request.json.get('format')
@@ -168,9 +222,7 @@ def export_data():
             pdf.set_font("Arial", size=9)
             col_width = 190 / (len(df.columns) or 1)
             
-            # FIX: Aggressive text sanitizer for PDF to prevent crashes
             def sanitize(text):
-                # Only allows safe ASCII characters, replaces weird symbols with a '?'
                 return "".join([c if ord(c) < 128 else '?' for c in str(text)[:30]])
                 
             for col in df.columns:
@@ -197,7 +249,6 @@ def export_data():
             table.set_fontsize(12)
             table.scale(1, 2) 
             
-            # FIX: Lowered DPI to 200 to prevent out-of-memory server crashes on Render Free Tier
             plt.savefig(output, format='png', bbox_inches='tight', dpi=200) 
             plt.close('all') 
             
@@ -208,7 +259,6 @@ def export_data():
         return send_file(output, mimetype=mimetype, as_attachment=True, download_name=filename)
         
     except Exception as e:
-        # If it fails, print the error to your Render logs and tell the user gracefully
         print(f"EXPORT ERROR: {str(e)}")
         return jsonify({'error': f'Failed to generate file: {str(e)}'}), 500
 
